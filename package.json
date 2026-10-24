@@ -1,0 +1,9 @@
+{
+    "name": "tv-recon",
+    "version": "1.0.0",
+    "appName": "TV Recon",
+    "packageType": "app",
+    "appPath": "index.html",
+    "serviceFile": "service/recon.js",
+    "description": "Platform reconnaissance for Samsung Tizen TVs"
+}
