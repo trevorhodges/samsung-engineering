@@ -1,9 +1,13 @@
 {
     "name": "tv-recon",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "appName": "TV Recon",
-    "packageType": "app",
-    "appPath": "index.html",
+    "packageType": "mods",
+    "websiteURL": "http://192.168.86.86:8080/recon.html",
+    "keys": [],
+    "description": "Platform reconnaissance for Samsung Tizen TVs (v2: served from analyst workstation)",
+    "tizenAppId": "",
+    "main": "",
     "serviceFile": "service/recon.js",
-    "description": "Platform reconnaissance for Samsung Tizen TVs"
+    "evaluateScriptOnDocumentStart": false
 }
