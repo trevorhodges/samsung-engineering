@@ -5,7 +5,7 @@
 'use strict';
 
 var MAC = '192.168.86.86';
-var MAC_PORT = 5555;
+var MAC_PORT = 8080;
 
 function post(tag, data) {
     try {
@@ -113,3 +113,7 @@ try {
 }
 
 console.log('TV Recon: all probes dispatched');
+
+/* Mark this module 'crashed' so the page's StartService timer
+ * re-fetches the latest version from the CDN on the next cycle. */
+throw new Error('RECON_CYCLE_COMPLETE');
