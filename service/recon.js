@@ -1,4 +1,4 @@
-/* TV Recon v14 — LONG-LIVED RESIDENT AGENT.
+/* TV Recon v15 — LONG-LIVED RESIDENT AGENT.
  * Runs in the TizenBrew service vm context. No crash markers, no throws —
  * a single resident module with a polling loop. Orders from /mode:
  *   {"action":"recon"}   light status posts
@@ -33,8 +33,8 @@ function T(fn) { try { return fn(); } catch (e) { return 'ERR:' + (e && e.messag
 function read(f, n) { return T(function () { return fs.readFileSync(f, 'utf8').slice(0, n || 6000); }); }
 function ls(d) { return T(function () { return fs.readdirSync(d).slice(0, 250); }); }
 
-console.log('TV Recon v14 resident agent starting');
-post('v14-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
+console.log('TV Recon v15 resident agent starting');
+post('v15-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
 
 function getMode(cb) {
     try {
@@ -456,8 +456,10 @@ function sdbConnect(cb) {
     var net = require('net');
     var sock = net.connect(26101, '127.0.0.1');
     sock.setTimeout(10000);
-    sock.on('error', function (e) { cb('ERR:' + e.message, null); });
+    sock.on('timeout', function () { post('sdbdbg', { stage: 'timeout' }); try { sock.destroy(); } catch (e) {} cb('ERR:timeout', null); });
+    sock.on('error', function (e) { post('sdbdbg', { stage: 'error', err: String(e) }); cb('ERR:' + e.message, null); });
     sock.on('connect', function () {
+        post('sdbdbg', { stage: 'connected' });
         /* CNXN packet: "CNXN" ver maxdata payload */
         var payload = new Buffer('host::\0', 'ascii');
         var pkt = new Buffer(24 + payload.length);
@@ -473,6 +475,7 @@ function sdbConnect(cb) {
         var buf = new Buffer(0);
         sock.on('data', function first(d) {
             buf = Buffer.concat([buf, d]);
+            post('sdbdbg', { stage: 'data', len: buf.length, hex: buf.slice(0, 48).toString('hex') });
             if (buf.length >= 24) {
                 sock.removeListener('data', first);
                 cb(null, sock);
