@@ -1,4 +1,4 @@
-/* TV Recon v15 — LONG-LIVED RESIDENT AGENT.
+/* TV Recon v16 — LONG-LIVED RESIDENT AGENT.
  * Runs in the TizenBrew service vm context. No crash markers, no throws —
  * a single resident module with a polling loop. Orders from /mode:
  *   {"action":"recon"}   light status posts
@@ -33,8 +33,8 @@ function T(fn) { try { return fn(); } catch (e) { return 'ERR:' + (e && e.messag
 function read(f, n) { return T(function () { return fs.readFileSync(f, 'utf8').slice(0, n || 6000); }); }
 function ls(d) { return T(function () { return fs.readdirSync(d).slice(0, 250); }); }
 
-console.log('TV Recon v15 resident agent starting');
-post('v15-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
+console.log('TV Recon v16 resident agent starting');
+post('v16-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
 
 function getMode(cb) {
     try {
@@ -468,7 +468,7 @@ function sdbConnect(cb) {
         pkt.writeUInt32LE(4096, 8);
         pkt.writeUInt32LE(payload.length, 12);
         pkt.writeUInt32LE(0, 16);
-        pkt.writeUInt32LE(0xFFFFFFFF ^ 0x4E584E43, 20);
+        pkt.writeUInt32LE((0xFFFFFFFF ^ 0x4E584E43) >>> 0, 20);
         payload.copy(pkt, 24);
         sock.write(pkt);
         /* skip the daemon's CNXN response, then ready */
@@ -495,7 +495,7 @@ function sdbShell(cmd, cb) {
         open.writeUInt32LE(0, 8);
         open.writeUInt32LE(svc.length, 12);
         open.writeUInt32LE(0, 16);
-        open.writeUInt32LE(0xFFFFFFFF ^ 0x4E504F, 20);
+        open.writeUInt32LE((0xFFFFFFFF ^ 0x4E504F) >>> 0, 20);
         svc.copy(open, 24);
         s.write(open);
         var out = '';
