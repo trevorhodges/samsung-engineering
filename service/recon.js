@@ -1,4 +1,4 @@
-/* TV Recon v16 — LONG-LIVED RESIDENT AGENT.
+/* TV Recon v17 — LONG-LIVED RESIDENT AGENT.
  * Runs in the TizenBrew service vm context. No crash markers, no throws —
  * a single resident module with a polling loop. Orders from /mode:
  *   {"action":"recon"}   light status posts
@@ -33,8 +33,8 @@ function T(fn) { try { return fn(); } catch (e) { return 'ERR:' + (e && e.messag
 function read(f, n) { return T(function () { return fs.readFileSync(f, 'utf8').slice(0, n || 6000); }); }
 function ls(d) { return T(function () { return fs.readdirSync(d).slice(0, 250); }); }
 
-console.log('TV Recon v16 resident agent starting');
-post('v16-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
+console.log('TV Recon v17 resident agent starting');
+post('v17-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
 
 function getMode(cb) {
     try {
@@ -461,16 +461,10 @@ function sdbConnect(cb) {
     sock.on('connect', function () {
         post('sdbdbg', { stage: 'connected' });
         /* CNXN packet: "CNXN" ver maxdata payload */
-        var payload = new Buffer('host::\0', 'ascii');
-        var pkt = new Buffer(24 + payload.length);
-        pkt.write('CNXN', 0, 'ascii');
-        pkt.writeUInt32LE(0x01000000, 4);
-        pkt.writeUInt32LE(4096, 8);
-        pkt.writeUInt32LE(payload.length, 12);
-        pkt.writeUInt32LE(0, 16);
-        pkt.writeUInt32LE((0xFFFFFFFF ^ 0x4E584E43) >>> 0, 20);
-        payload.copy(pkt, 24);
+        /* byte-exact clone of the CNXN adbhost sends (accepted by this sdbd per mitm capture) */
+        var pkt = new Buffer('434e584e000000010010000006000000000000000bcb1a7b1686f73743a3a00', 'hex');
         sock.write(pkt);
+        post('sdbdbg', { stage: 'cnxn-written', hex: pkt.toString('hex') });
         /* skip the daemon's CNXN response, then ready */
         var buf = new Buffer(0);
         sock.on('data', function first(d) {
