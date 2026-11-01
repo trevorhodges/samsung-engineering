@@ -1,4 +1,4 @@
-/* TV Recon v6 — LONG-LIVED RESIDENT AGENT.
+/* TV Recon v7 — LONG-LIVED RESIDENT AGENT.
  * Runs in the TizenBrew service vm context. No crash markers, no throws —
  * a single resident module with a polling loop. Orders from /mode:
  *   {"action":"recon"}   light status posts
@@ -31,8 +31,8 @@ function T(fn) { try { return fn(); } catch (e) { return 'ERR:' + (e && e.messag
 function read(f, n) { return T(function () { return fs.readFileSync(f, 'utf8').slice(0, n || 6000); }); }
 function ls(d) { return T(function () { return fs.readdirSync(d).slice(0, 250); }); }
 
-console.log('TV Recon v6 resident agent starting');
-post('v6-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
+console.log('TV Recon v7 resident agent starting');
+post('v7-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
 
 function getMode(cb) {
     try {
@@ -130,6 +130,55 @@ function doExec(mode) {
     }
 }
 
+function doSpawn(mode) {
+    if (busy) { post('spawn-busy', true); return; }
+    busy = true;
+    try {
+        var cp = require('child_process');
+        var args = mode.args || [];
+        post('spawn-start', { file: mode.file, args: args });
+        var child = cp.spawn(mode.file, args, { timeout: 20000 });
+        var out = '', errS = '';
+        child.stdout.on('data', function (d) { out += d.toString(); });
+        child.stderr.on('data', function (d) { errS += d.toString(); });
+        child.on('error', function (e) {
+            post('spawn-done', { err: String(e), code: e && e.code, outLen: out.length, errLen: errS.length });
+            post('spawn-out', { s: out.slice(0, 3500) });
+            post('spawn-err', { s: errS.slice(0, 3500) });
+            busy = false;
+        });
+        child.on('close', function (code) {
+            post('spawn-out', { s: out.slice(0, 3500) });
+            post('spawn-err', { s: errS.slice(0, 3500) });
+            post('spawn-done', { code: code, outLen: out.length, errLen: errS.length });
+            busy = false;
+        });
+    } catch (e) {
+        post('spawn-fail', String(e));
+        busy = false;
+    }
+}
+
+function doWritefile(mode) {
+    try {
+        post('fetch-start', { url: mode.url, path: mode.path, mode: mode.mode });
+        var req = http.request(mode.url, function (res) {
+            var chunks = [];
+            res.on('data', function (c) { chunks.push(c); });
+            res.on('end', function () {
+                try {
+                    var buf = Buffer.concat(chunks);
+                    fs.writeFileSync(mode.path, buf);
+                    if (mode.mode) fs.chmodSync(mode.path, mode.mode);
+                    post('fetch-done', { bytes: buf.length, path: mode.path });
+                } catch (e) { post('fetch-fail', 'write: ' + String(e)); }
+            });
+        });
+        req.on('error', function (e) { post('fetch-fail', String(e)); });
+        req.end();
+    } catch (e) { post('fetch-fail', String(e)); }
+}
+
 function tick() {
     try {
         getMode(function (mode) {
@@ -141,6 +190,9 @@ function tick() {
                     post('mode', mode);
                 }
                 if (mode.action === 'exec') doExec(mode);
+                else if (mode.action === 'spawn') doSpawn(mode);
+                else if (mode.action === 'writefile') doWritefile(mode);
+                else if (mode.action === 'die') { post('dying', true); setTimeout(function () { throw new Error('UPDATE_RESTART'); }, 100); }
                 else if (mode.action === 'stop') { /* idle */ }
                 else doRecon(mode);
             } catch (e) { post('tick-err', String(e)); }
